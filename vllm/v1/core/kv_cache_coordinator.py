@@ -163,7 +163,7 @@ class KVCacheCoordinator(ABC):
 
         Returns:
             The new allocated blocks.
-        """
+        """        
         return tuple(
             manager.allocate_new_blocks(
                 request_id,

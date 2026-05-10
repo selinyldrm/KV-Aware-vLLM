@@ -10,6 +10,8 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
+import json
+import os
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -27,6 +29,20 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+def _load_kv_importance_tiers(request_id: str) -> dict[int, str]:
+    path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
+    if not path:
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            all_tiers = json.load(f)
+    except Exception:
+        return {}
+
+    tiers = all_tiers.get(str(request_id), {})
+    return {int(k): str(v) for k, v in tiers.items()}
 
 
 @dataclass
@@ -60,6 +76,7 @@ class Request:
     def __init__(
         self,
         request_id: str,
+        
         prompt_token_ids: list[int] | None,
         sampling_params: SamplingParams | None,
         pooling_params: PoolingParams | None,
@@ -77,6 +94,7 @@ class Request:
         reasoning_ended: bool | None = None,
     ) -> None:
         self.request_id = request_id
+        self.kv_importance_tiers: dict[int, str] = _load_kv_importance_tiers(request_id) # [SY]
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params

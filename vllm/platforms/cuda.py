@@ -504,6 +504,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+            # handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
             return DeviceCapability(major=major, minor=minor)
         except RuntimeError:

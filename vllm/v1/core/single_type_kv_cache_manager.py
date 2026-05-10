@@ -222,15 +222,54 @@ class SingleTypeKVCacheManager(ABC):
         Returns:
             The new allocated blocks.
         """
+        # req_blocks = self.req_to_blocks[request_id]
+        # num_required_blocks = cdiv(num_tokens, self.block_size)
+        # num_new_blocks = num_required_blocks - len(req_blocks)
+        # if num_new_blocks <= 0:
+        #     return []
+        # else:
+        #     new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        #     req_blocks.extend(new_blocks)
+        #     return new_blocks
+        
         req_blocks = self.req_to_blocks[request_id]
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        import random
+        token_importance = []
+        for x in range(num_tokens) : 
+            token_importance.append(random.randint(1, 3))
         num_new_blocks = num_required_blocks - len(req_blocks)
         if num_new_blocks <= 0:
             return []
-        else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
-            req_blocks.extend(new_blocks)
-            return new_blocks
+
+        new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        req_blocks.extend(new_blocks)
+
+        # Tag each new block with its average importance
+        # if token_importance is not None:
+        already_allocated = len(req_blocks) - num_new_blocks
+        for i, block in enumerate(new_blocks):
+            block_idx = already_allocated + i
+            
+            
+            # [SY] read importance values here later
+            start = block_idx * self.block_size
+            end = min(start + self.block_size, len(token_importance))
+            if start < len(token_importance):
+                block.importance = sum(token_importance[start:end]) / (end - start)
+            else:
+                block.importance = 0.0  # padding/generated tokens
+                
+        # [SY]: expand all req_blocks to token-level and push to shared registry
+        from vllm.v1.importance_registry import set_importance 
+        full_token_importance = []
+        for block in req_blocks:
+            full_token_importance.extend(
+                [getattr(block, "importance", 1.0)] * self.block_size
+            )
+        set_importance(request_id, full_token_importance[:num_tokens])
+
+        return new_blocks
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
         """

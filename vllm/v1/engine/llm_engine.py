@@ -135,6 +135,36 @@ class LLMEngine:
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
 
+    # def get_kv_cache_heatmap_data(self):
+    #     import numpy as np
+    #     try:
+    #         # 1. Reach into the In-Process EngineCore
+    #         # LLMEngine -> EngineCoreClient -> EngineCore -> Scheduler -> KVCacheManager
+    #         core = self.engine_core.core_en gi
+    #         kv_manager = core.scheduler.kv_cache_manager
+            
+    #         # 2. V1 often uses a 'SingleTypeKVCacheManager' or similar
+    #         # We need to get the BlockPool which actually holds the ref_counts
+    #         # Note: If you have multiple managers (e.g. MLA + Full), you may need to iterate
+    #         block_pool = kv_manager.managers[0].block_pool 
+            
+    #         num_blocks = block_pool.num_gpu_blocks
+    #         block_hits = np.zeros(num_blocks)
+            
+    #         # 3. Map physical block usage
+    #         # In V1, ref_count is the most reliable way to see "hits" (shared blocks)
+    #         for i, block in enumerate(block_pool.blocks):
+    #             # block_hits[i] = block.ref_count # Current active users
+                
+    #             # If you want to see if it's currently in the prefix cache:
+    #             if block.block_hash is not None:
+    #                 block_hits[i] += 1
+                    
+    #         return block_hits
+    #     except Exception as e:
+    #         print(f"Heatmap extraction failed: {e}")
+    #         return None
+    
     @classmethod
     def from_vllm_config(
         cls,

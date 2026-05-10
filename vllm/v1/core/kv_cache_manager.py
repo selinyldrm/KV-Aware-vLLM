@@ -161,6 +161,11 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def set_block_importance(self, block_id: int, tier: str) -> None:
+        if not getattr(self.block_pool, "enable_kv_importance", False):
+            return
+        self.block_pool.set_block_importance(block_id, tier)
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -202,6 +207,23 @@ class KVCacheManager:
             )
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
+
+    def _set_importance_for_request_blocks(self, request: Request) -> None:
+        if not getattr(self.block_pool, "enable_kv_importance", False):
+            return
+
+        tiers = getattr(request, "kv_importance_tiers", None)
+        if not tiers:
+            return
+
+        block_ids_by_group = self.get_block_ids(request.request_id)
+
+        for group_block_ids in block_ids_by_group:
+            for logical_block_idx, block_id in enumerate(group_block_ids):
+                tier = tiers.get(logical_block_idx)
+                if tier is not None:
+                    self.block_pool.set_block_importance(block_id, tier)
+
 
     def allocate_slots(
         self,
@@ -372,6 +394,9 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        
+        self._set_importance_for_request_blocks(request) # [SY]
+
 
         return self.create_kv_cache_blocks(new_blocks)
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+import os
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -153,6 +154,12 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
+        
+        self.enable_kv_importance = (
+            os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") == "1"
+        )
+        self.kv_importance_by_block_id = {} # [SY]
+
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
@@ -178,6 +185,33 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+    def set_block_importance(self, block_id, tier: str) -> None:
+        if not self.enable_kv_importance:
+            return
+
+        if hasattr(block_id, "tolist"):
+            block_id = block_id.tolist()
+
+        if isinstance(block_id, (list, tuple)):
+            for bid in block_id:
+                self.set_block_importance(bid, tier)
+            return
+
+        if hasattr(block_id, "block_id"):
+            block_id = block_id.block_id
+
+        self.kv_importance_by_block_id[int(block_id)] = str(tier)
+
+
+    def get_block_importance_rank(self, block) -> int:
+        if not self.enable_kv_importance:
+            return 1
+
+        tier = self.kv_importance_by_block_id.get(block.block_id, "cpu")
+        return {"disk": 0, "cpu": 1, "gpu": 2}.get(tier, 1)
+
+
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -396,11 +430,19 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        if self.enable_kv_importance:
+            blocks_list = sorted(
+                blocks_list,
+                key=lambda b: self.get_block_importance_rank(b),
+            )
+
         for block in blocks_list:
             block.ref_cnt -= 1
+            self.kv_importance_by_block_id.pop(block.block_id, None)
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

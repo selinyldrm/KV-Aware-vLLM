@@ -1,0 +1,14 @@
+{
+    "timestamp": 1775075659.7704449,
+    "metrics": {
+        "hits_tokens": 0.0,
+        "total_lookup_tokens": 0.0,
+        "cpu_usage_gb": 0.0,
+        "disk_usage_gb": 0.0,
+        "cpu_evictions": 0.0
+    },
+    "summary": {
+        "hit_rate": "0%",
+        "status": "Success"
+    }
+}

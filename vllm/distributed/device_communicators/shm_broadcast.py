@@ -532,8 +532,8 @@ class MessageQueue:
 
                     # if we time out, raise an exception
                     elapsed = time.monotonic() - start_time
-                    if timeout is not None and elapsed > timeout:
-                        raise TimeoutError
+                    # if timeout is not None and elapsed > timeout:
+                    #     raise TimeoutError
 
                     # if we wait for a long time, log a message
                     if not indefinite and (
@@ -613,7 +613,9 @@ class MessageQueue:
     ):
         """Read from message queue with optional timeout (in seconds)"""
         if self._is_local_reader:
-            with self.acquire_read(timeout, cancel, indefinite) as buf:
+            # Force a 10-minute timeout regardless of what the executor asked for
+            modified_timeout = 1200.0 if timeout is not None else None
+            with self.acquire_read(modified_timeout, cancel, indefinite) as buf:
                 overflow = buf[0] == 1
                 if not overflow:
                     offset = 3

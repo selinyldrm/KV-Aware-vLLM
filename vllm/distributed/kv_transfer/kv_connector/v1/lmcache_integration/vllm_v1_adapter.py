@@ -5,11 +5,14 @@ import os
 import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, List
 
 import torch
 from lmcache import utils
 from lmcache.config import LMCacheEngineMetadata
+import json
+import os
+
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -66,6 +69,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# [SY]
+from vllm.v1.importance_registry import pop_importance
 
 @dataclass
 class LoadSpec:
@@ -249,6 +254,10 @@ class RequestTracker:
 class ReqMeta:
     # Request id
     req_id: str
+    
+    # [SY]: per-token importance scores
+    importance: Optional[List[float]] = None  
+    
     # Request tokens
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
@@ -576,6 +585,7 @@ class LMCacheConnectorV1Impl:
     ):
         assert vllm_config.kv_transfer_config is not None
         self._parent = parent
+        
         self._vllm_config = vllm_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.worker_count = vllm_config.parallel_config.tensor_parallel_size
@@ -929,6 +939,32 @@ class LMCacheConnectorV1Impl:
                 logger.info("Retrieved %s tokens", num_retrieved_tokens)
 
         return
+    
+    # [SY]
+    # def importance_to_tier(
+    #     importance: Optional[List[int]],
+    #     store_mask: torch.Tensor,
+    #     chunk_size: int,
+    #     high_thresh: float = 2.0,
+    # ) -> Optional[List[str]]:
+    #     """Compute one tier string per LMCache chunk for a single request
+    #         — batched_put will then fan out to the backend returned by this tier.
+    #     """
+    #     if importance is None:
+    #         return None
+
+    #     chunk_tiers = []
+    #     # Active tokens start where store_mask becomes True
+    #     skip = int((~store_mask).sum().item())  # number of leading Falses
+
+    #     for chunk_start in range(skip, len(importance), chunk_size):
+    #         chunk_end = min(chunk_start + chunk_size, len(importance))
+    #         chunk_imp = importance[chunk_start:chunk_end]
+    #         avg = sum(chunk_imp) / len(chunk_imp) if chunk_imp else 0.0
+    #         tier = "LocalCPUBackend" if avg >= high_thresh else "LocalDiskBackend"
+    #         chunk_tiers.append(tier)
+
+    #     return chunk_tiers  # List[str], one per chunk
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
@@ -1002,6 +1038,7 @@ class LMCacheConnectorV1Impl:
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
+                
 
                 logger.info(
                     "Storing KV cache for %d out of %d tokens "
@@ -1014,6 +1051,23 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
+                # [SY]
+                target_tiers = self._get_target_tiers_for_request(
+                    request.req_id,
+                    len(token_ids),
+                    store_mask,
+                    self._lmcache_chunk_size,
+                )
+
+                # layerwise_storer = self.lmcache_engine.store_layer(
+                #     token_ids,
+                #     mask=store_mask,
+                #     kvcaches=kvcaches,
+                #     slot_mapping=slot_mapping,
+                #     offset=skip_leading_tokens,
+                #     sync=is_first,
+                # )
+                # [SY]
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -1021,7 +1075,9 @@ class LMCacheConnectorV1Impl:
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
                     sync=is_first,
+                    target_tiers=target_tiers,
                 )
+
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
                     is_first = False
@@ -1030,6 +1086,78 @@ class LMCacheConnectorV1Impl:
             next(layerwise_storer)
 
         self.current_layer += 1
+
+    # [SY]
+    def _load_kv_importance_tiers(self):
+        if os.environ.get("VLLM_KV_IMPORTANCE_ENABLE") != "1":
+            return {}
+
+        path = os.environ.get("VLLM_KV_IMPORTANCE_TIERS")
+        if not path:
+            return {}
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to load KV importance tiers from %s: %s", path, e)
+            return {}
+
+    # [SY]
+    def _get_request_block_tiers(self, req_id: str):
+        if not hasattr(self, "_kv_importance_tiers"):
+            self._kv_importance_tiers = self._load_kv_importance_tiers()
+
+        tiers = self._kv_importance_tiers.get(str(req_id), {})
+        return {int(k): str(v) for k, v in tiers.items()}
+
+    # [SY]
+    def _tier_to_lmcache_location(self, tier: str) -> str:
+        if tier == "disk":
+            return "LocalDiskBackend"
+
+        # gpu means: if LMCache stores it anyway, keep it in fast CPU tier.
+        return "LocalCPUBackend"
+
+    def _get_target_tiers_for_request(
+        self,
+        req_id: str,
+        num_tokens: int,
+        store_mask: torch.Tensor,
+        chunk_size: int,
+    ):
+        block_tiers = self._get_request_block_tiers(req_id)
+        if not block_tiers:
+            return None
+
+        gnn_block_size = int(os.environ.get("GNN_KV_BLOCK_SIZE", "16"))
+
+        first_stored_token = int((~store_mask).sum().item())
+        target_locations = []
+
+        for chunk_start in range(first_stored_token, num_tokens, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_tokens)
+
+            first_block = chunk_start // gnn_block_size
+            last_block = (chunk_end - 1) // gnn_block_size
+
+            chunk_block_tiers = [
+                block_tiers.get(block_idx, "cpu")
+                for block_idx in range(first_block, last_block + 1)
+            ]
+
+            if "gpu" in chunk_block_tiers:
+                target_tier = "gpu"
+            elif "cpu" in chunk_block_tiers:
+                target_tier = "cpu"
+            else:
+                target_tier = "disk"
+
+            target_locations.append(self._tier_to_lmcache_location(target_tier))
+
+
+        return target_locations
+
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1114,6 +1242,25 @@ class LMCacheConnectorV1Impl:
                 store_mask = store_mask[:aligned_token_len]
                 slot_mapping = slot_mapping[:aligned_token_len]
 
+            
+            # [SY]
+            target_tiers = self._get_target_tiers_for_request(
+                request.req_id,
+                len(token_ids),
+                store_mask,
+                self._lmcache_chunk_size,
+            )
+
+            # self.lmcache_engine.store(
+            #     token_ids,
+            #     mask=store_mask,
+            #     kvcaches=kvcaches,
+            #     slot_mapping=slot_mapping,
+            #     offset=skip_leading_tokens,
+            #     transfer_spec=request.disagg_spec,
+            #     request_configs=request.request_configs,
+            # )
+            # [SY]
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,
@@ -1122,7 +1269,9 @@ class LMCacheConnectorV1Impl:
                 offset=skip_leading_tokens,
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
+                target_tiers=target_tiers,
             )
+
 
             # NOTE(Jiayi): We assume all tokens are saved
             save_spec.skip_leading_tokens = len(token_ids)
@@ -1355,6 +1504,8 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                # [SY]: attach importance from registry
+                req_meta.importance = pop_importance(request.req_id)
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -1375,6 +1526,8 @@ class LMCacheConnectorV1Impl:
                     discard_partial_chunks=self._discard_partial_chunks,
                 )
                 if req_meta is not None:
+                    # [SY]: attach importance
+                    req_meta.importance = pop_importance(request.req_id)
                     meta.add_request(req_meta)
             return meta
 
@@ -1404,6 +1557,8 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                # [SY]: attach importance
+                req_meta.importance = pop_importance(request.req_id)
                 meta.add_request(req_meta)
 
         return meta
