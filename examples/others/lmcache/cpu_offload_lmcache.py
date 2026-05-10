@@ -105,9 +105,8 @@ def parse_arguments():
     parser.add_argument(
         "--question",
         type=str,
-        default="what is one of the stars of  The Newcomers known for",
     )
-    parser.add_argument("--questions_json", type=str, default=None)
+    parser.add_argument("--questions_json", type=str)
 
     parser.add_argument(
         "--gnn_ckpt",
@@ -396,7 +395,7 @@ def main():
 
     if not args.question and not args.questions_json:
         raise ValueError("provide either --question or --questions_json")
-
+    
     setup_environment_variables()
 
     questions = load_questions(args)
