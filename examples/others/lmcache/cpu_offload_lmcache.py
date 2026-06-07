@@ -22,6 +22,27 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
+import hashlib
+def passage_prefix_signature(sorted_passage, n=2):
+    prefix = "\n".join(sorted_passage[:n])
+    return hashlib.sha1(prefix.encode("utf-8")).hexdigest()
+
+
+def reorder_by_shared_passage_prefix(llm_inputs, prompt_records, n=2):
+    pairs = list(zip(llm_inputs, prompt_records))
+
+    pairs.sort(
+        key=lambda x: (
+            passage_prefix_signature(x[1]["sorted_passage"], n=n),
+            x[1]["question"],
+        )
+    )
+
+    new_llm_inputs = [p[0] for p in pairs]
+    new_prompt_records = [p[1] for p in pairs]
+
+    return new_llm_inputs, new_prompt_records
+
 
 HKV_ROOT = Path("/mnt/shared/gpfs/home/seliny2/vllm/Hierarchical_KV").resolve()
 sys.path.insert(0, str(HKV_ROOT.parent))
@@ -418,6 +439,12 @@ def main():
         retrieval_results,
         vllm_tokenizer,
     )
+    llm_inputs, prompt_records = reorder_by_shared_passage_prefix(
+        llm_inputs,
+        prompt_records,
+        n=2,
+    )
+
     print("retrieval and vLLM prompt construction finished", flush=True)
 
     node_features, edge_index, edge_weight, node_name_to_idx, passage_text_to_hash = (
@@ -482,14 +509,25 @@ def main():
     os.environ["VLLM_KV_IMPORTANCE_TIERS"] = "/tmp/kv_importance_tiers.json"
     os.environ["GNN_KV_BLOCK_SIZE"] = str(16)
     
-    os.environ["VLLM_KV_IMPORTANCE_ENABLE"] = "1"
+    os.environ["VLLM_KV_IMPORTANCE_ENABLE"] = "0"
+   
+    # llm_inputs = [llm_inputs[0]] * 1000
 
     with build_llm_with_lmcache(lmcache_connector, args.llm_model) as llm:
         kv_reset()
-
+        
+        print(f"Cold run starting...")
         start = time.time()
         outputs = llm.generate(llm_inputs, sampling_params)
         time_taken = time.time() - start
+        print(f"first generation took {time_taken:.2f} seconds.")
+        
+        print(f"Warm run starting...")
+        start = time.time()
+        outputs = llm.generate(llm_inputs, sampling_params)
+        time_taken = time.time() - start
+        print(f"Second generation took {time_taken:.2f} seconds.")
+
 
         save_kv_monitor_results(args.dataset_name, start)
 
@@ -497,7 +535,6 @@ def main():
             generated_text = output.outputs[0].text
             print(f"Output: {generated_text!r}")
 
-        print(f"Generation took {time_taken:.2f} seconds.")
 
         summary_path = hook.dump_summary()
         print(f"LMCache hook summary written to: {summary_path}")
